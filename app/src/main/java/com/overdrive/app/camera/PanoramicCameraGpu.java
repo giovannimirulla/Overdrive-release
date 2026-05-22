@@ -1,5 +1,6 @@
 package com.overdrive.app.camera;
 
+import android.graphics.Bitmap;
 import android.graphics.ImageFormat;
 import android.hardware.HardwareBuffer;
 import android.media.Image;
@@ -429,7 +430,7 @@ public class PanoramicCameraGpu {
         }
         
         // Initialize foveated cropper for high-res AI crops
-        foveatedCropper = new FoveatedCropper();
+        foveatedCropper = new FoveatedCropper(width, height);
         foveatedCropper.init();
         
         logger.info( "OpenGL initialized (texture=" + cameraTextureId + ")");
@@ -933,7 +934,7 @@ public class PanoramicCameraGpu {
                         lastDataCameraId = currentId;
                         
                         // During auto-probe: accept the first camera with non-black panoramic data.
-                        // The 5120x960 resolution IS the panoramic strip identifier on BYD — no other
+                        // The wide panoramic strip geometry is the identifier on BYD — no other
                         // camera output uses this resolution with real image data. The luma-based
                         // strip check was producing false negatives in low-light/uniform scenes.
                         if (autoProbeCameras) {
@@ -1015,11 +1016,13 @@ public class PanoramicCameraGpu {
                             // Only write back if there's no manual override, or if the manual override
                             // matches what we're currently running (user's choice is already applied)
                             if (!hasManualOverride || savedId == currentId) {
-                                org.json.JSONObject camCfg = new org.json.JSONObject();
-                                camCfg.put("probedCameraId", currentId);
-                                camCfg.put("probedSurfaceMode", cameraSurfaceMode);
-                                camCfg.put("probedAndValidated", true);
-                                com.overdrive.app.config.UnifiedConfigManager.updateSection("camera", camCfg);
+                                com.overdrive.app.camera.CameraConfigResolver.persistPanoramicProbe(
+                                    currentId,
+                                    cameraSurfaceMode,
+                                    width,
+                                    height,
+                                    true,
+                                    false);
                             } else {
                                 logger.info("Skipping config write — manual override exists (saved=" + savedId + ", running=" + currentId + ")");
                             }
@@ -1403,12 +1406,13 @@ public class PanoramicCameraGpu {
                 }
                 // Persist this as a fallback so next restart doesn't re-probe
                 try {
-                    org.json.JSONObject camCfg = new org.json.JSONObject();
-                    camCfg.put("probedCameraId", lastDataCameraId);
-                    camCfg.put("probedSurfaceMode", 0);
-                    camCfg.put("probedAndValidated", true);
-                    camCfg.put("fallbackFromProbe", true);
-                    com.overdrive.app.config.UnifiedConfigManager.updateSection("camera", camCfg);
+                    com.overdrive.app.camera.CameraConfigResolver.persistPanoramicProbe(
+                        lastDataCameraId,
+                        0,
+                        width,
+                        height,
+                        true,
+                        true);
                     logger.info("Persisted fallback camera ID " + lastDataCameraId + " for next launch");
                 } catch (Exception ex) {
                     logger.warn("Failed to persist fallback camera config: " + ex.getMessage());
@@ -2237,9 +2241,100 @@ public class PanoramicCameraGpu {
      * @return JPEG byte array, or null if not available
      */
     public byte[] getLatestJpegFrame(int cameraId) {
-        // This would need to be implemented by storing the latest extracted frame
-        // For now, return null (MJPEG streaming handles this via callback)
-        return null;
+        if (!running || glHandler == null || downscaler == null || cameraTextureId == 0 || !probeComplete) {
+            return null;
+        }
+
+        final Object lock = new Object();
+        final byte[][] resultHolder = new byte[1][];
+
+        glHandler.post(() -> {
+            try {
+                byte[] mosaicRgb = downscaler.readPixelsDirect(cameraTextureId);
+                if (mosaicRgb == null) {
+                    return;
+                }
+
+                final int mosaicWidth = 640;
+                final int mosaicHeight = 480;
+                final int quadrantWidth = mosaicWidth / 2;
+                final int quadrantHeight = mosaicHeight / 2;
+
+                int cropX = 0;
+                int cropY = 0;
+                int outputWidth = mosaicWidth;
+                int outputHeight = mosaicHeight;
+
+                switch (cameraId) {
+                    case 1: // Front (top-left)
+                        cropX = 0;
+                        cropY = 0;
+                        outputWidth = quadrantWidth;
+                        outputHeight = quadrantHeight;
+                        break;
+                    case 2: // Right (top-right)
+                        cropX = quadrantWidth;
+                        cropY = 0;
+                        outputWidth = quadrantWidth;
+                        outputHeight = quadrantHeight;
+                        break;
+                    case 3: // Rear (bottom-left)
+                        cropX = 0;
+                        cropY = quadrantHeight;
+                        outputWidth = quadrantWidth;
+                        outputHeight = quadrantHeight;
+                        break;
+                    case 4: // Left (bottom-right)
+                        cropX = quadrantWidth;
+                        cropY = quadrantHeight;
+                        outputWidth = quadrantWidth;
+                        outputHeight = quadrantHeight;
+                        break;
+                    case 0: // Full mosaic preview
+                    default:
+                        break;
+                }
+
+                int[] pixels = new int[outputWidth * outputHeight];
+                int dst = 0;
+                for (int y = 0; y < outputHeight; y++) {
+                    int srcY = cropY + y;
+                    for (int x = 0; x < outputWidth; x++) {
+                        int srcX = cropX + x;
+                        int srcIdx = (srcY * mosaicWidth + srcX) * 3;
+                        if (srcIdx + 2 >= mosaicRgb.length) {
+                            pixels[dst++] = 0xFF000000;
+                            continue;
+                        }
+                        int r = mosaicRgb[srcIdx] & 0xFF;
+                        int g = mosaicRgb[srcIdx + 1] & 0xFF;
+                        int b = mosaicRgb[srcIdx + 2] & 0xFF;
+                        pixels[dst++] = 0xFF000000 | (r << 16) | (g << 8) | b;
+                    }
+                }
+
+                Bitmap bitmap = Bitmap.createBitmap(pixels, outputWidth, outputHeight, Bitmap.Config.ARGB_8888);
+                java.io.ByteArrayOutputStream jpegOut = new java.io.ByteArrayOutputStream();
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 82, jpegOut);
+                bitmap.recycle();
+                resultHolder[0] = jpegOut.toByteArray();
+            } catch (Exception e) {
+                logger.warn("getLatestJpegFrame failed: " + e.getMessage());
+            } finally {
+                synchronized (lock) {
+                    lock.notifyAll();
+                }
+            }
+        });
+
+        synchronized (lock) {
+            try {
+                lock.wait(600);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        return resultHolder[0];
     }
     
     /**
